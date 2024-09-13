@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD    ["functions-framework", "--target", "humidity_data_to_bigquery"]
+CMD ["functions-framework", "--target", "humidity_data_to_bigquery"]
