@@ -1,1 +1,479 @@
-// Combined script to fetch all historical SensorPush data and load into BigQuery\n\nimport axios from 'axios';\nimport { BigQuery } from '@google-cloud/bigquery';\n\n// --- Configuration ---\nconst SENSORPUSH_EMAIL = 'poll.twelfth0k@icloud.com'; // Consider moving to env variables\nconst SENSORPUSH_PASSWORD = 'i9B9HiQRoT676odn';      // Consider moving to env variables\nconst GOOGLE_PROJECT_ID = 'savvy-fountain-431023-t4';\nconst BIGQUERY_DATASET_ID = 'Humidity';\nconst BIGQUERY_TABLE_ID = 'all_data';\nconst BIGQUERY_BATCH_SIZE = 500; // Rows per BigQuery insert batch\nconst SENSORPUSH_API_LIMIT = 5000; // Max samples per SensorPush API request\n\n// Define sensor mapping from name to ID and room\nconst SENSOR_MAPPING = {\n  \"Bedroom Sensor\": {\n    id: \"469508.27177040722098928308\",\n    room: \"Bedroom\"\n  },\n  \"Front Sensor\": {\n    id: \"475020.27064303433454696280\",\n    room: \"Entryway\"\n  },\n  \"Living Room Corner\": {\n    id: \"475030.1098946490148859685\",\n    room: \"Living Room\"\n  }\n  // Add more sensors here if needed\n};\n\n// --- Helper Functions ---\n\n/**\n * Logs a message with a timestamp.\n * @param {string} message The message to log.\n */\nfunction log(message) {\n    console.log(`[${new Date().toISOString()}] ${message}`);\n}\n\n/**\n * Logs an error message with details.\n * @param {string} message The error message.\n * @param {Error} [error] Optional error object.\n */\nfunction logError(message, error) {\n    console.error(`[${new Date().toISOString()}] ERROR: ${message}`);\n    if (error) {\n        // Log specific parts of Axios errors if available\n        if (error.response) {\n            console.error('  Response Status:', error.response.status);\n            console.error('  Response Data:', JSON.stringify(error.response.data, null, 2));\n        } else if (error.request) {\n            console.error('  No response received for request:', error.request);\n        } else {\n            console.error('  Error Details:', error.message);\n        }\n        if (error.stack) {\n            console.error('  Stack Trace:', error.stack);\n        }\n    }\n}\n\n// --- Main Logic ---\n\n/**\n * Fetches the SensorPush authorization token.\n */\nasync function getAuthorizationToken() {\n    log(\"Step 1: Requesting SensorPush authorization token...\");\n    try {\n        const response = await axios({\n            method: \"post\",\n            url: \"https://api.sensorpush.com/api/v1/oauth/authorize\",\n            headers: { \"Content-Type\": \"application/json\" },\n            data: {\n                \"email\": SENSORPUSH_EMAIL,\n                \"password\": SENSORPUSH_PASSWORD\n            }\n        });\n        const authToken = response.data.authorization;\n        if (!authToken) {\n            throw new Error(\"Authorization token not found in SensorPush response.\");\n        }\n        log(\"Authorization token obtained successfully.\");\n        return authToken;\n    } catch (error) {\n        logError(\"Failed to obtain SensorPush authorization token.\", error);\n        throw error; // Re-throw to stop execution\n    }\n}\n\n/**\n * Fetches the SensorPush access token using the authorization token.\n * @param {string} authorizationToken The authorization token.\n */\nasync function getAccessToken(authorizationToken) {\n    log(\"Step 2: Requesting SensorPush access token...\");\n    try {\n        const response = await axios({\n            method: \"post\",\n            url: \"https://api.sensorpush.com/api/v1/oauth/accesstoken\",\n            headers: { \"Content-Type\": \"application/json\" },\n            data: { \"authorization\": authorizationToken }\n        });\n        const accessToken = response.data.accesstoken;\n         if (!accessToken) {\n            throw new Error(\"Access token not found in SensorPush response.\");\n        }\n        log(\"Access token obtained successfully.\");\n        return accessToken;\n    } catch (error) {\n        logError(`Failed to obtain SensorPush access token. Auth token start: ${String(authorizationToken).substring(0,5)}...`, error);\n        throw error; // Re-throw to stop execution\n    }\n}\n\n/**\n * Fetches all historical sensor data from SensorPush API with pagination.\n * @param {string} accessToken The SensorPush access token.\n */\nasync function fetchAllSensorData(accessToken) {\n    log(`Step 3: Fetching ALL historical data for ${Object.keys(SENSOR_MAPPING).length} sensors...`);\n    let allSensorReadings = []; // Flat array to store all readings\n    const fetchErrors = [];\n\n    for (const [sensorName, sensorInfo] of Object.entries(SENSOR_MAPPING)) {\n        const { id: sensorId, room } = sensorInfo;\n        log(` -> Processing sensor: ${sensorName} (ID: ${sensorId})`);\n\n        const startTimestamp = '1970-01-01T00:00:00Z'; // Start from epoch\n        let moreDataAvailable = true;\n        let currentStartTime = startTimestamp;\n        let sensorSpecificReadings = [];\n        let batchNum = 1;\n\n        while (moreDataAvailable) {\n            log(`    Fetching batch ${batchNum} for ${sensorName} starting from ${currentStartTime}`);\n            try {\n                const response = await axios({\n                    method: \"post\",\n                    url: \"https://api.sensorpush.com/api/v1/samples\",\n                    headers: {\n                        \"Authorization\": accessToken,\n                        \"Content-Type\": \"application/json\"\n                    },\n                    data: {\n                        \"sensors\": [sensorId],\n                        \"limit\": SENSORPUSH_API_LIMIT,\n                        \"startTime\": currentStartTime\n                    }\n                });\n\n                const fetchedData = response.data;\n                const samplesReturned = fetchedData?.samples_returned ?? 0;\n                log(`      Received ${samplesReturned} samples.`);\n\n                if (fetchedData.sensors && fetchedData.sensors[sensorId] && fetchedData.sensors[sensorId].length > 0) {\n                    // Process and add sensor_name/room within this step\n                    const newReadings = fetchedData.sensors[sensorId].map(entry => ({\n                        ...entry,\n                        sensor_name: sensorName,\n                        room: room\n                    }));\n                    sensorSpecificReadings.push(...newReadings);\n\n                    if (samplesReturned === SENSORPUSH_API_LIMIT) {\n                        const lastTimestamp = newReadings[newReadings.length - 1].observed;\n                        const nextStartTime = new Date(new Date(lastTimestamp).getTime() + 1);\n                        currentStartTime = nextStartTime.toISOString();\n                        moreDataAvailable = true;\n                        batchNum++;\n                    } else {\n                        moreDataAvailable = false;\n                        log(`      Finished fetching all data for ${sensorName}.`);\n                    }\n                } else {\n                    moreDataAvailable = false;\n                    log(`      No further data found for ${sensorName} starting from ${currentStartTime}.`);\n                }\n\n            } catch (apiError) {\n                logError(`API Error during batch fetch for sensor ${sensorName} (start: ${currentStartTime})`, apiError);\n                fetchErrors.push(`API Error for sensor ${sensorName} (start: ${currentStartTime}): ${apiError.message}`);\n                moreDataAvailable = false; // Stop fetching for this sensor on error\n            }\n        } // End while loop (pagination)\n\n        log(` -> Collected total ${sensorSpecificReadings.length} historical entries for ${sensorName}.`);\n        allSensorReadings.push(...sensorSpecificReadings); // Add to the main flat array\n\n    } // End for loop (sensors)\n\n    log(`Step 3 Complete: Total historical readings fetched across all sensors: ${allSensorReadings.length}`);\n    if (fetchErrors.length > 0) {\n        logError(`Encountered ${fetchErrors.length} errors during data fetch:`);\n        fetchErrors.forEach((err, i) => console.error(`   ${i + 1}: ${err}`));\n    }\n    return allSensorReadings; // Return the flat array\n}\n\n\n/**\n * Processes the raw sensor data into the format for BigQuery.\n * @param {Array<object>} rawReadings Flat array of readings from fetchAllSensorData.\n */\nfunction processSensorData(rawReadings) {\n    log(`Step 4: Processing ${rawReadings.length} raw readings...`);\n    const processedData = [];\n    let skippedCount = 0;\n\n    rawReadings.forEach(reading => {\n        // Basic validation\n        if (!reading || typeof reading.observed === 'undefined' || typeof reading.humidity === 'undefined' || !reading.sensor_name) {\n            // console.warn(`Skipping invalid reading:`, reading); // Uncomment for debugging\n            skippedCount++;\n            return;\n        }\n\n        processedData.push({\n            observed: reading.observed, // Keep ISO format string\n            temperature: reading.temperature,\n            humidity_percent: reading.humidity / 100, // Convert to fraction\n            dewpoint: reading.dewpoint,\n            vpd: reading.vpd,\n            sensor_name: reading.sensor_name,\n            room: reading.room || 'Unknown', // Use room added during fetch\n        });\n    });\n\n    log(`Step 4 Complete: Processed ${processedData.length} valid readings. Skipped ${skippedCount} invalid readings.`);\n    if (processedData.length > 0) {\n        log(`Sample processed reading: ${JSON.stringify(processedData[0], null, 2)}`);\n    }\n    return processedData;\n}\n\n/**\n * Loads data into BigQuery, handling deduplication and batch insertion.\n * @param {Array<object>} dataToLoad The processed data array.\n */\nasync function loadDataToBigQuery(dataToLoad) {\n    log(`Step 5: Loading ${dataToLoad.length} processed records into BigQuery...`);\n    const startTime = Date.now();\n    let credentials;\n    const loadErrors = [];\n    let uniqueData = [];\n    let duplicatesFound = 0;\n    let totalInserted = 0;\n\n    if (dataToLoad.length === 0) {\n        log(\"No data to load into BigQuery. Skipping Step 5.\");\n        return { duplicatesFound: 0, rowsInserted: 0, errors: [] };\n    }\n\n    try {\n        // --- Initialize BigQuery Client ---\n        log(\" -> Initializing BigQuery client...\");\n        try {\n            credentials = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS);\n        } catch (parseError) {\n            throw new Error(`Invalid GOOGLE_CLOUD_CREDENTIALS format: ${parseError.message}`);\n        }\n        const bigquery = new BigQuery({ credentials, projectId: GOOGLE_PROJECT_ID });\n        const dataset = bigquery.dataset(BIGQUERY_DATASET_ID);\n        const table = dataset.table(BIGQUERY_TABLE_ID);\n        const tablePath = `\`${GOOGLE_PROJECT_ID}.${BIGQUERY_DATASET_ID}.${BIGQUERY_TABLE_ID}\``;\n        log(\" -> BigQuery client initialized.\");\n\n\n        // --- Deduplication ---\n        log(` -> Starting deduplication against ${tablePath}...`);\n        const uniqueSensorNames = [...new Set(dataToLoad.map(row => row.sensor_name))];\n        const existingEntriesQuery = `\n            SELECT DISTINCT sensor_name, observed\n            FROM ${tablePath}\n            WHERE sensor_name IN UNNEST(@sensor_names) AND observed IS NOT NULL\n        `;\n        const [existingRows] = await bigquery.query({\n            query: existingEntriesQuery,\n            params: { sensor_names: uniqueSensorNames },\n        });\n\n        const existingEntries = new Set(\n            existingRows.map(row => {\n                const observedTs = row.observed?.value || row.observed; // Handle BQ timestamp object/string\n                return `${row.sensor_name}-${observedTs}`;\n            })\n        );\n        log(` -> Found ${existingEntries.size} existing entries in BigQuery for relevant sensors.`);\n\n        uniqueData = dataToLoad.filter(row => {\n            const key = `${row.sensor_name}-${row.observed}`;\n            return !existingEntries.has(key);\n        });\n        duplicatesFound = dataToLoad.length - uniqueData.length;\n        log(` -> Deduplication complete: ${uniqueData.length} unique rows identified. Skipped ${duplicatesFound} duplicates.`);\n\n\n        // --- Batch Insertion ---\n        if (uniqueData.length > 0) {\n            log(` -> Starting BigQuery insertion for ${uniqueData.length} unique rows...`);\n            for (let i = 0; i < uniqueData.length; i += BIGQUERY_BATCH_SIZE) {\n                const batch = uniqueData.slice(i, i + BIGQUERY_BATCH_SIZE);\n                const batchNumber = i / BIGQUERY_BATCH_SIZE + 1;\n                log(`    Inserting batch ${batchNumber} (${batch.length} rows)`);\n                try {\n                    const [response] = await table.insert(batch);\n                    totalInserted += batch.length;\n\n                    if (response && response.insertErrors && response.insertErrors.length > 0) {\n                        const errorDetail = `BigQuery reported insertion errors for batch ${batchNumber}`;\n                        logError(errorDetail, { message: JSON.stringify(response.insertErrors)});\n                        loadErrors.push(`${errorDetail}: ${JSON.stringify(response.insertErrors)}`);\n                        // Decide whether to continue or stop on partial failure\n                    }\n                } catch (insertError) {\n                     const errorDetail = `BigQuery insertion API call failed for batch ${batchNumber}`;\n                     logError(errorDetail, insertError);\n                     loadErrors.push(`${errorDetail}: ${insertError.message}`);\n                     // Decide whether to stop entirely on batch failure\n                     // throw insertError; // Option to halt execution\n                }\n            }\n            log(` -> Finished BigQuery insertions. Attempted insertion for ${totalInserted} rows.`);\n        } else {\n            log(\" -> No unique data remaining after deduplication, nothing inserted.\");\n        }\n\n    } catch (error) {\n        logError(\"Critical error during BigQuery load step.\", error);\n        loadErrors.push(`Critical BQ Error: ${error.message}`);\n        // Depending on where the error occurred, uniqueData might not be fully processed\n    }\n\n    const durationSec = ((Date.now() - startTime) / 1000).toFixed(2);\n    log(`Step 5 Complete: BigQuery load finished in ${durationSec} seconds.`);\n    return { duplicatesFound, rowsInserted: totalInserted, errors: loadErrors };\n}\n\n\n// --- Main Execution ---\nasync function main() {\n    log(\"=== Starting SensorPush Full Historical Data Load ===\");\n    const overallStart = Date.now();\n    let finalStatus = \"SUCCESS\";\n    let summary = {};\n\n    try {\n        // Step 1 & 2: Authentication\n        const authorizationToken = await getAuthorizationToken();\n        const accessToken = await getAccessToken(authorizationToken);\n\n        // Step 3: Fetch All Data\n        const rawReadings = await fetchAllSensorData(accessToken);\n\n        // Step 4: Process Data\n        const processedData = processSensorData(rawReadings);\n\n        // Step 5: Load to BigQuery\n        const loadResult = await loadDataToBigQuery(processedData);\n\n        summary = {\n            totalRawReadingsFetched: rawReadings.length,\n            totalProcessedReadings: processedData.length,\n            duplicatesSkipped: loadResult.duplicatesFound,\n            rowsAttemptedForInsert: loadResult.rowsInserted,\n            bigQueryLoadErrors: loadResult.errors.length,\n        };\n        if (loadResult.errors.length > 0) {\n            finalStatus = \"PARTIAL_FAILURE\";\n        }\n\n    } catch (error) {\n        logError(\"Pipeline execution failed with critical error.\", error);\n        finalStatus = \"FAILURE\";\n        summary.criticalError = error.message;\n    } finally {\n        const overallDurationSec = ((Date.now() - overallStart) / 1000).toFixed(2);\n        log(\"=== Pipeline Finished ===\");\n        log(`Status: ${finalStatus}`);\n        log(`Total Duration: ${overallDurationSec} seconds`);\n        log(`Summary: ${JSON.stringify(summary, null, 2)}`);\n        if (finalStatus !== \"SUCCESS\") {\n            process.exitCode = 1; // Indicate failure to shell/orchestrator\n        }\n    }\n}\n\n// --- Run the script ---\nmain(); 
+// Combined script to fetch all historical SensorPush data and load into BigQuery
+
+import axios from 'axios';
+import { BigQuery } from '@google-cloud/bigquery';
+import fs from 'fs';
+import path from 'path';
+
+// --- Configuration ---
+
+// ** Credentials (Set via Environment Variables) **
+const SENSORPUSH_EMAIL = process.env.SENSORPUSH_EMAIL;
+const SENSORPUSH_PASSWORD = process.env.SENSORPUSH_PASSWORD;
+// GOOGLE_APPLICATION_CREDENTIALS environment variable should be set to the path of your service account key file.
+
+// Check for essential credentials
+if (!SENSORPUSH_EMAIL || !SENSORPUSH_PASSWORD) {
+    console.error("ERROR: Missing SENSORPUSH_EMAIL or SENSORPUSH_PASSWORD environment variables.");
+    process.exit(1);
+}
+if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+     console.warn("WARNING: GOOGLE_APPLICATION_CREDENTIALS environment variable not set. Authentication might fail unless running in a GCP environment with implicit credentials.");
+}
+
+// ** Project/Dataset/Table Configuration (Defaults can be overridden by Env Vars) **
+const GOOGLE_PROJECT_ID = process.env.GOOGLE_PROJECT_ID || 'savvy-fountain-431023-t4';
+const BIGQUERY_DATASET_ID = process.env.BIGQUERY_DATASET_ID || 'Humidity';
+const BIGQUERY_TABLE_ID = process.env.BIGQUERY_TABLE_ID || 'all_data';
+
+// ** API/Batch Limits (Defaults can be overridden by Env Vars) **
+const BIGQUERY_BATCH_SIZE = parseInt(process.env.BIGQUERY_BATCH_SIZE || '500', 10);
+const SENSORPUSH_API_LIMIT = parseInt(process.env.SENSORPUSH_API_LIMIT || '5000', 10);
+
+// ** Sensor Mapping (Read from sensors.json) **
+let SENSOR_MAPPING = {};
+const sensorsFilePath = path.join(__dirname, 'sensors.json');
+try {
+    if (fs.existsSync(sensorsFilePath)) {
+        const sensorsFileContent = fs.readFileSync(sensorsFilePath, 'utf8');
+        SENSOR_MAPPING = JSON.parse(sensorsFileContent);
+        log(`Loaded sensor mapping from ${sensorsFilePath}`);
+        if (Object.keys(SENSOR_MAPPING).length === 0) {
+             throw new Error('sensors.json is empty or contains no sensor mappings.');
+        }
+        // Validate the structure briefly
+        Object.values(SENSOR_MAPPING).forEach(sensorInfo => {
+            if (!sensorInfo.name || !sensorInfo.id) {
+                throw new Error(`Invalid sensor entry in sensors.json: missing 'name' or 'id'. Entry: ${JSON.stringify(sensorInfo)}`);
+            }
+        });
+    } else {
+        throw new Error(`Configuration file not found: ${sensorsFilePath}. Please create it based on sensors.example.json.`);
+    }
+} catch (error) {
+    logError(`Failed to load or parse ${sensorsFilePath}`, error);
+    process.exit(1);
+}
+
+// --- Helper Functions ---
+
+/**
+ * Logs a message with a timestamp.
+ * @param {string} message The message to log.
+ */
+function log(message) {
+    console.log(`[${new Date().toISOString()}] ${message}`);
+}
+
+/**
+ * Logs an error message with details.
+ * @param {string} message The error message.
+ * @param {Error} [error] Optional error object.
+ */
+function logError(message, error) {
+    console.error(`[${new Date().toISOString()}] ERROR: ${message}`);
+    if (error) {
+        // Log specific parts of Axios errors if available
+        if (error.response) {
+            console.error('  Response Status:', error.response.status);
+            console.error('  Response Data:', JSON.stringify(error.response.data, null, 2));
+        } else if (error.request) {
+            console.error('  No response received for request:', error.request);
+        } else {
+            console.error('  Error Details:', error.message);
+        }
+        if (error.stack) {
+            console.error('  Stack Trace:', error.stack);
+        }
+    }
+}
+
+// --- Main Logic ---
+
+/**
+ * Fetches the SensorPush authorization token.
+ */
+async function getAuthorizationToken() {
+    log("Step 1: Requesting SensorPush authorization token...");
+    try {
+        const response = await axios({
+            method: "post",
+            url: "https://api.sensorpush.com/api/v1/oauth/authorize",
+            headers: { "Content-Type": "application/json" },
+            data: {
+                "email": SENSORPUSH_EMAIL,         // Use environment variable
+                "password": SENSORPUSH_PASSWORD      // Use environment variable
+            }
+        });
+        const authToken = response.data.authorization;
+        if (!authToken) {
+            throw new Error("Authorization token not found in SensorPush response.");
+        }
+        log("Authorization token obtained successfully.");
+        return authToken;
+    } catch (error) {
+        logError("Failed to obtain SensorPush authorization token.", error);
+        throw error; // Re-throw to stop execution
+    }
+}
+
+/**
+ * Fetches the SensorPush access token using the authorization token.
+ * @param {string} authorizationToken The authorization token.
+ */
+async function getAccessToken(authorizationToken) {
+    log("Step 2: Requesting SensorPush access token...");
+    try {
+        const response = await axios({
+            method: "post",
+            url: "https://api.sensorpush.com/api/v1/oauth/accesstoken",
+            headers: { "Content-Type": "application/json" },
+            data: { "authorization": authorizationToken }
+        });
+        const accessToken = response.data.accesstoken;
+         if (!accessToken) {
+            throw new Error("Access token not found in SensorPush response.");
+        }
+        log("Access token obtained successfully.");
+        return accessToken;
+    } catch (error) {
+        logError(`Failed to obtain SensorPush access token. Auth token start: ${String(authorizationToken).substring(0,5)}...`, error);
+        throw error; // Re-throw to stop execution
+    }
+}
+
+/**
+ * Fetches the list of sensor devices registered to the account.
+ * @param {string} accessToken The SensorPush access token.
+ * @returns {Promise<object>} A map of device IDs to device names.
+ */
+async function fetchSensorDevices(accessToken) {
+    log("Step 2a: Fetching list of registered SensorPush devices...");
+    try {
+        const response = await axios({
+            method: "post", // Use POST as per SensorPush examples for consistency
+            url: "https://api.sensorpush.com/api/v1/devices",
+            headers: {
+                "Authorization": accessToken,
+                "Content-Type": "application/json"
+            },
+            data: {} // Empty body
+        });
+
+        const devices = response.data; // Should be an object { device_id: { name: ... }, ... }
+        if (!devices || typeof devices !== 'object') {
+            throw new Error("Unexpected format received from /devices endpoint.");
+        }
+
+        const deviceCount = Object.keys(devices).length;
+        log(` -> Found ${deviceCount} registered devices in the account.`);
+
+        if (deviceCount > 0) {
+            log(" -> Registered Device List (Name: ID):");
+            for (const [id, info] of Object.entries(devices)) {
+                console.log(`      - ${info.name}: ${id}`);
+            }
+            log(" -> Use the IDs above to help configure your sensors.json file.");
+        }
+
+        return devices;
+    } catch (error) {
+        logError("Failed to fetch SensorPush device list. Will proceed without this information.", error);
+        return null; // Return null on error, allow the script to continue
+    }
+}
+
+/**
+ * Fetches all historical sensor data from SensorPush API with pagination.
+ * @param {string} accessToken The SensorPush access token.
+ */
+async function fetchAllSensorData(accessToken) {
+    log(`Step 3: Fetching ALL historical data for ${Object.keys(SENSOR_MAPPING).length} sensors defined in sensors.json...`);
+    let allSensorReadings = []; // Flat array to store all readings
+    const fetchErrors = [];
+
+    // Iterate through the sensor configuration object
+    for (const [configKey, sensorInfo] of Object.entries(SENSOR_MAPPING)) {
+        const { name: sensorName, id: sensorId, room } = sensorInfo; // Destructure using the new structure
+        log(` -> Processing sensor: ${sensorName} (ID: ${sensorId}, Config Key: ${configKey})`);
+
+        const startTimestamp = '1970-01-01T00:00:00Z'; // Start from epoch
+        let moreDataAvailable = true;
+        let currentStartTime = startTimestamp;
+        let sensorSpecificReadings = [];
+        let batchNum = 1;
+
+        while (moreDataAvailable) {
+            log(`    Fetching batch ${batchNum} for ${sensorName} starting from ${currentStartTime}`);
+            try {
+                const response = await axios({
+                    method: "post",
+                    url: "https://api.sensorpush.com/api/v1/samples",
+                    headers: {
+                        "Authorization": accessToken,
+                        "Content-Type": "application/json"
+                    },
+                    data: {
+                        "sensors": [sensorId],
+                        "limit": SENSORPUSH_API_LIMIT,
+                        "startTime": currentStartTime
+                    }
+                });
+
+                const fetchedData = response.data;
+                const samplesReturned = fetchedData?.samples_returned ?? 0;
+                log(`      Received ${samplesReturned} samples.`);
+
+                if (fetchedData.sensors && fetchedData.sensors[sensorId] && fetchedData.sensors[sensorId].length > 0) {
+                    // Process and add the custom sensor_name and room
+                    const newReadings = fetchedData.sensors[sensorId].map(entry => ({
+                        ...entry,
+                        sensor_name: sensorName, // Use the custom name from sensorInfo.name
+                        room: room || 'Unknown' // Use room from sensorInfo, default if missing
+                    }));
+                    sensorSpecificReadings.push(...newReadings);
+
+                    if (samplesReturned === SENSORPUSH_API_LIMIT) {
+                        const lastTimestamp = newReadings[newReadings.length - 1].observed;
+                        const nextStartTime = new Date(new Date(lastTimestamp).getTime() + 1);
+                        currentStartTime = nextStartTime.toISOString();
+                        moreDataAvailable = true;
+                        batchNum++;
+                    } else {
+                        moreDataAvailable = false;
+                        log(`      Finished fetching all data for ${sensorName}.`);
+                    }
+                } else {
+                    moreDataAvailable = false;
+                    log(`      No further data found for ${sensorName} starting from ${currentStartTime}.`);
+                }
+
+            } catch (apiError) {
+                logError(`API Error during batch fetch for ${sensorName} (start: ${currentStartTime})`, apiError);
+                fetchErrors.push(`API Error for sensor ${sensorName} (start: ${currentStartTime}): ${apiError.message}`);
+                moreDataAvailable = false; // Stop fetching for this sensor on error
+            }
+        } // End while loop (pagination)
+
+        log(` -> Collected total ${sensorSpecificReadings.length} historical entries for ${sensorName}.`);
+        allSensorReadings.push(...sensorSpecificReadings); // Add to the main flat array
+
+    } // End for loop (sensors)
+
+    log(`Step 3 Complete: Total historical readings fetched across all sensors: ${allSensorReadings.length}`);
+    if (fetchErrors.length > 0) {
+        logError(`Encountered ${fetchErrors.length} errors during data fetch:`);
+        fetchErrors.forEach((err, i) => console.error(`   ${i + 1}: ${err}`));
+    }
+    return allSensorReadings; // Return the flat array
+}
+
+/**
+ * Processes the raw sensor data into the format for BigQuery.
+ * @param {Array<object>} rawReadings Flat array of readings from fetchAllSensorData.
+ */
+function processSensorData(rawReadings) {
+    log(`Step 4: Processing ${rawReadings.length} raw readings...`);
+    const processedData = [];
+    let skippedCount = 0;
+
+    rawReadings.forEach(reading => {
+        // Basic validation - sensor_name and room are now added during fetch
+        if (!reading || typeof reading.observed === 'undefined' || typeof reading.humidity === 'undefined' || !reading.sensor_name) {
+            // console.warn(`Skipping invalid reading:`, reading); // Uncomment for debugging
+            skippedCount++;
+            return;
+        }
+
+        processedData.push({
+            observed: reading.observed, // Keep ISO format string
+            temperature: reading.temperature,
+            humidity_percent: reading.humidity / 100, // Convert to fraction
+            dewpoint: reading.dewpoint,
+            vpd: reading.vpd,
+            sensor_name: reading.sensor_name, // Already contains the custom name
+            room: reading.room, // Already contains the room name
+        });
+    });
+
+    log(`Step 4 Complete: Processed ${processedData.length} valid readings. Skipped ${skippedCount} invalid readings.`);
+    if (processedData.length > 0) {
+        log(`Sample processed reading: ${JSON.stringify(processedData[0], null, 2)}`);
+    }
+    return processedData;
+}
+
+/**
+ * Loads data into BigQuery, handling deduplication and batch insertion.
+ * @param {Array<object>} dataToLoad The processed data array.
+ */
+async function loadDataToBigQuery(dataToLoad) {
+    log(`Step 5: Loading ${dataToLoad.length} processed records into BigQuery...`);
+    const startTime = Date.now();
+    let credentials;
+    const loadErrors = [];
+    let uniqueData = [];
+    let duplicatesFound = 0;
+    let totalInserted = 0;
+
+    if (dataToLoad.length === 0) {
+        log("No data to load into BigQuery. Skipping Step 5.");
+        return { duplicatesFound: 0, rowsInserted: 0, errors: [] };
+    }
+
+    try {
+        // --- Initialize BigQuery Client ---
+        log(" -> Initializing BigQuery client...");
+        try {
+            credentials = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS);
+        } catch (parseError) {
+            throw new Error(`Invalid GOOGLE_CLOUD_CREDENTIALS format: ${parseError.message}`);
+        }
+        const bigquery = new BigQuery({ credentials, projectId: GOOGLE_PROJECT_ID });
+        const dataset = bigquery.dataset(BIGQUERY_DATASET_ID);
+        const table = dataset.table(BIGQUERY_TABLE_ID);
+        const tablePath = `\`${GOOGLE_PROJECT_ID}.${BIGQUERY_DATASET_ID}.${BIGQUERY_TABLE_ID}\``;
+        log(" -> BigQuery client initialized.");
+
+        // --- Deduplication ---
+        log(` -> Starting deduplication against ${tablePath}...`);
+        const uniqueSensorNames = [...new Set(dataToLoad.map(row => row.sensor_name))];
+        const existingEntriesQuery = `
+            SELECT DISTINCT sensor_name, observed
+            FROM ${tablePath}
+            WHERE sensor_name IN UNNEST(@sensor_names) AND observed IS NOT NULL
+        `;
+        const [existingRows] = await bigquery.query({
+            query: existingEntriesQuery,
+            params: { sensor_names: uniqueSensorNames },
+        });
+
+        const existingEntries = new Set(
+            existingRows.map(row => {
+                const observedTs = row.observed?.value || row.observed; // Handle BQ timestamp object/string
+                return `${row.sensor_name}-${observedTs}`;
+            })
+        );
+        log(` -> Found ${existingEntries.size} existing entries in BigQuery for relevant sensors.`);
+
+        uniqueData = dataToLoad.filter(row => {
+            const key = `${row.sensor_name}-${row.observed}`;
+            return !existingEntries.has(key);
+        });
+        duplicatesFound = dataToLoad.length - uniqueData.length;
+        log(` -> Deduplication complete: ${uniqueData.length} unique rows identified. Skipped ${duplicatesFound} duplicates.`);
+
+        // --- Batch Insertion ---
+        if (uniqueData.length > 0) {
+            log(` -> Starting BigQuery insertion for ${uniqueData.length} unique rows...`);
+            for (let i = 0; i < uniqueData.length; i += BIGQUERY_BATCH_SIZE) {
+                const batch = uniqueData.slice(i, i + BIGQUERY_BATCH_SIZE);
+                const batchNumber = i / BIGQUERY_BATCH_SIZE + 1;
+                log(`    Inserting batch ${batchNumber} (${batch.length} rows)`);
+                try {
+                    const [response] = await table.insert(batch);
+                    totalInserted += batch.length;
+
+                    if (response && response.insertErrors && response.insertErrors.length > 0) {
+                        const errorDetail = `BigQuery reported insertion errors for batch ${batchNumber}`;
+                        logError(errorDetail, { message: JSON.stringify(response.insertErrors) });
+                        loadErrors.push(`${errorDetail}: ${JSON.stringify(response.insertErrors)}`);
+                        // Decide whether to continue or stop on partial failure
+                    }
+                } catch (insertError) {
+                     const errorDetail = `BigQuery insertion API call failed for batch ${batchNumber}`;
+                     logError(errorDetail, insertError);
+                     loadErrors.push(`${errorDetail}: ${insertError.message}`);
+                     // Decide whether to stop entirely on batch failure
+                     // throw insertError; // Option to halt execution
+                }
+            }
+            log(` -> Finished BigQuery insertions. Attempted insertion for ${totalInserted} rows.`);
+        } else {
+            log(" -> No unique data remaining after deduplication, nothing inserted.");
+        }
+
+    } catch (error) {
+        logError("Critical error during BigQuery load step.", error);
+        loadErrors.push(`Critical BQ Error: ${error.message}`);
+        // Depending on where the error occurred, uniqueData might not be fully processed
+    }
+
+    const durationSec = ((Date.now() - startTime) / 1000).toFixed(2);
+    log(`Step 5 Complete: BigQuery load finished in ${durationSec} seconds.`);
+    return { duplicatesFound, rowsInserted: totalInserted, errors: loadErrors };
+}
+
+// --- Main Execution ---
+async function main() {
+    log("=== Starting SensorPush Full Historical Data Load ===");
+    const overallStart = Date.now();
+    let finalStatus = "SUCCESS";
+    let summary = {};
+
+    try {
+        // Step 1 & 2: Authentication
+        const authorizationToken = await getAuthorizationToken();
+        const accessToken = await getAccessToken(authorizationToken);
+
+        // Step 2a: Fetch and log device list (informational)
+        const registeredDevices = await fetchSensorDevices(accessToken);
+
+        // Optional: Compare registeredDevices with SENSOR_MAPPING from sensors.json
+        if (registeredDevices) {
+            const configuredSensorIds = new Set(Object.values(SENSOR_MAPPING).map(s => s.id));
+            const registeredSensorIds = new Set(Object.keys(registeredDevices));
+
+            // Check for sensors in account but not configured
+            for (const registeredId of registeredSensorIds) {
+                if (!configuredSensorIds.has(registeredId)) {
+                    log(`WARNING: Sensor found in account but not in sensors.json -> ${registeredDevices[registeredId].name}: ${registeredId}`);
+                }
+            }
+
+            // Check for sensors configured but not in account
+            for (const configuredSensor of Object.values(SENSOR_MAPPING)) {
+                if (!registeredSensorIds.has(configuredSensor.id)) {
+                    log(`WARNING: Sensor ID in sensors.json not found in account -> ${configuredSensor.name}: ${configuredSensor.id}`);
+                }
+            }
+        }
+
+        // Step 3: Fetch All Data based on sensors.json mapping
+        const rawReadings = await fetchAllSensorData(accessToken);
+
+        // Step 4: Process Data
+        const processedData = processSensorData(rawReadings);
+
+        // Step 5: Load to BigQuery
+        const loadResult = await loadDataToBigQuery(processedData);
+
+        summary = {
+            totalRawReadingsFetched: rawReadings.length,
+            totalProcessedReadings: processedData.length,
+            duplicatesSkipped: loadResult.duplicatesFound,
+            rowsAttemptedForInsert: loadResult.rowsInserted,
+            bigQueryLoadErrors: loadResult.errors.length,
+        };
+        if (loadResult.errors.length > 0) {
+            finalStatus = "PARTIAL_FAILURE";
+        }
+
+    } catch (error) {
+        logError("Pipeline execution failed with critical error.", error);
+        finalStatus = "FAILURE";
+        summary.criticalError = error.message;
+    } finally {
+        const overallDurationSec = ((Date.now() - overallStart) / 1000).toFixed(2);
+        log("=== Pipeline Finished ===");
+        log(`Status: ${finalStatus}`);
+        log(`Total Duration: ${overallDurationSec} seconds`);
+        log(`Summary: ${JSON.stringify(summary, null, 2)}`);
+        if (finalStatus !== "SUCCESS") {
+            process.exitCode = 1; // Indicate failure to shell/orchestrator
+        }
+    }
+}
+
+// --- Run the script ---
+main(); 

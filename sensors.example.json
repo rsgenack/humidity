@@ -1,0 +1,17 @@
+{
+  "bedroom": {
+    "name": "Bedroom Sensor", 
+    "id": "YOUR_BEDROOM_SENSOR_ID_HERE",
+    "room": "Bedroom"
+  },
+  "living_room": {
+    "name": "Living Room Corner", 
+    "id": "YOUR_LIVING_ROOM_SENSOR_ID_HERE",
+    "room": "Living Room"
+  },
+  "front_entry": {
+    "name": "Front Sensor", 
+    "id": "ITS_SENSOR_ID",
+    "room": "Entryway"
+  }
+} 
