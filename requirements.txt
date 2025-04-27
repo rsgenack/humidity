@@ -1,4 +1,0 @@
-requests
-google-cloud-bigquery
-functions-framework==3.1.0
-axios
